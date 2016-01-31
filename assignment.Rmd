@@ -1,0 +1,147 @@
+---
+title: "PML Course Assignment"
+author: "A H"
+date: "Saturday, January 30, 2016"
+output: html_document
+---
+
+# Objective
+
+The objective of this report is to develop a classifier of weightlifting form based on body sensor measurements, and test the accuracy of the classifier on a hold-out test set.
+
+
+# Experiment
+
+The data for this project come from the Weight Lifting Exercise Dataset here: http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises#ixzz3yl3Oja5v.
+
+To summarize, six males aged 20-28 were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl (with 1.25 kg weight) in five different fashions: 
+
+- exactly according to the specification (Class A)
+- throwing the elbows to the front (Class B)
+- lifting the dumbbell only halfway (Class C)
+- lowering the dumbbell only halfway (Class D)
+- throwing the hips to the front (Class E).
+
+Class A is the specified (correct) fashion, and classes {B,C,D,E} are incorrect methods.  During the excercise, subjects wore on-body sensors (arm, forearm, belt, and on dumbell).  We seek to predict the Class given information about the subjects, time of experiment, and the kinetic measurements from the on-body sensors.  
+
+A confusion matrix diagrammed at the URL referenced above shows the study authors have achieved roughly 78.2% leave-one-out-cross-validation (LOOCV) accuracy on the dataset using a bagged Random Forest. 
+
+
+# Dataset
+
+```{r overview, echo=FALSE, message=FALSE}
+require(lubridate)
+require(caret)
+require(e1071)
+require(knitr)
+require(randomForest)
+
+source("assignment.R")
+Ntr <- nrow(training)
+Nte <- nrow(testing)
+M <- ncol(training)-1
+clevs <- levels(training$classe)
+nlevs <- nlevels(training$classe)
+Nindiv <- nlevels(training$user_name)
+```
+
+The dataset contains `r Ntr` training cases and `r Nte` test cases, on `r M` variables, derived from `r Nindiv` subjects. The number of classes to predict is `r nlevs`.
+
+To get a sense of the data, we display a small interval of values fro the gyroscopic forearm sensor X-coordinate, from subject __jeremy__ during a bout of curls: 
+```{r figs1, fig=TRUE, warning=FALSE}
+sp <- ggplot( subset(training, user_name=="jeremy"), aes(x=num_window, y=gyros_forearm_x)) + geom_point(shape=19, aes(color=classe)) + geom_line() + facet_grid(user_name ~ .) + ylim(-2.5,2.5) + xlim(405,515)
+sp
+```
+We see the examples of each of the training classes A-E.  X-coordinate excursions are largest in class B (throwing the elbow out), and they are reduced especially during class D (lowing the dumbell only half way).  This makes intuitive sense.
+
+
+# Model building and cross validation
+
+Given the nature of the activity, we expect there may be large differences in the profiles between the `r Nindiv` subjects.  In addition, with the large number of predictors, we expect many predictors to be correlated.  Therefore, we use principal components to reduce the space of predictors, and we fit a separate random forest model for each subject in the dataset.
+
+```{r train_fcns}
+preProcessFeatures <- function(training) {
+  j.sk <- grepl("^(skewness|kurtosis|max_yaw|amplitude_yaw|min_yaw)", names(training))
+  j.sparse <- apply(training, 2, function (z) sum(is.na(z)))>nrow(training)*0.90
+  training.vfilt <- training[,!j.sk & !j.sparse,]
+  training.vfilt <- training.vfilt[, 8:(ncol(training.vfilt)-1)]
+  training.vfilt.mat <- data.matrix(training.vfilt)
+}
+
+pmodel <- function(training.vfilt.mat) {
+  pp <- prcomp(training.vfilt.mat, center=TRUE, scale.=TRUE)
+}
+
+apply.pmod <- function(training.vfilt.mat, pmod, npp=10) {
+    predict(pmod, newdata=training.vfilt.mat)[,1:npp]
+}
+
+make.pred.frame <- function(training, tvmp) {
+    training.pp <- data.frame(classe=training$classe, 
+                          tvmp)
+}
+```
+
+```{r trainproc, cache=TRUE}
+# train
+tvm <- preProcessFeatures(training)
+pmod <- pmodel(tvm)
+tvmp <- apply.pmod(tvm, pmod)
+pf <- make.pred.frame(training, tvmp)
+pfl <- split(pf, training$user_name)  
+mod.rf <- list()
+set.seed(14173)
+for (user in levels(training$user_name)) {
+  mod.rf[[user]] <- train( classe ~ ., data=pfl[[user]], 
+                           method="rf",
+                           trainControl=trainControl("cv", number=10))
+}
+```
+
+The amount of variance explained the the PCAs is as follows:
+
+```{r pcaplot, fig=TRUE}
+plot(pmod)
+```
+
+Thus, we estimate 10 PCs contain most of the variance in the data. Plotting the training observations on the first 2 PCAs we see that the subject is the major driver of the first 2 PCAs, as expected.
+
+```{r pcasubs, fig=TRUE}
+sp <- ggplot(NULL, aes(x=pf$PC1, y=pf$PC2)) + 
+  geom_point(aes(color=training$classe, shape=training$user_name)) 
+sp
+```
+
+
+# Expected out of sample error
+
+The expected out of sample error is given by the caret train() function output, estimated by resampling in the training set:
+
+```{r oos}
+# Accuracy per-subject
+accuracy <- sapply(mod.rf, function(z) z$results$Accuracy[1])
+# Overall accuracy
+accuracy.overall <- sum(accuracy * sapply(pfl, nrow)) / sum(sapply(pfl,nrow))
+```
+
+Thus we estimate the accuracy in the hold-out set will be `r sprintf("%0.2f", accuracy.overall)`.
+
+The predictions on the test set are as follows:
+
+```{r testpred}
+# test
+tvm.t <- preProcessFeatures(testing)
+tvmp.t <- apply.pmod(tvm.t, pmod)
+preds <- factor(levels=levels(training$classe))
+for (user in levels(testing$user_name)) {
+  itt <- which(testing$user_name==user)
+  preds[itt] <- predict(mod.rf[[user]], newdata=data.frame(tvmp.t[itt,,drop=FALSE]))
+}
+```
+```{r tabres, results='as.is'}
+kable(data.frame(test.case=1:nrow(testing), predicted.class=preds))
+```
+
+# Conclusions
+
+A model was built on the weighlifting dataset. PCA was used to reduce the space of predictors, and subject-specific random forest models were used to control for between-subject variation in motions.  Resampling on the training set estimated the overall accuracy for out-of-sample data to be `r sprintf("%0.2f", accuracy.overall)`.  Predictions on the test set were made. 
